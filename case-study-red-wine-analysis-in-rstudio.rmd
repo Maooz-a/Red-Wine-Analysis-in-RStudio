@@ -1,0 +1,255 @@
+---
+title: 'Case Study: Red Wine Quality'
+author: "Maooz Abdullah"
+date: "`r format(Sys.Date())`"
+output: html_document
+---
+
+# Abstract
+
+I conducted this case study to demonstrate how I can transform a messy dataset into actionable insights. I chose the **Red Wine Quality** dataset, which originally contained issues such as inconsistent column names, missing values, and unscaled variables. My goal was to walk through the full data science workflow, from cleaning to modeling to interpretation.
+
+---
+
+# Setup
+
+Setting up Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core packages
+libs <- c(
+  "tidyverse", "tinytex", "janitor", "skimr", "broom", "rsample", "yardstick", "ggplot2", "scales"
+)
+need <- libs[!libs %in% installed.packages()[, "Package"]]
+if (length(need)) install.packages(need, quiet = TRUE)
+invisible(lapply(libs, library, character.only = TRUE))
+
+options(dplyr.width = Inf)
+set.seed(123)
+```
+
+---
+
+# Data Ingestion & Cleaning
+
+I’ll begin by loading the red wine data. The UCI file uses a **semicolon** separator and includes lowercase column names with spaces; I’ll **normalize** these names and confirm types.
+
+```{r load-data}
+# Try to download from UCI; if offline, look for a local copy next to this Rmd
+uci_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
+local_path <- "winequality-red.csv"
+
+if (!file.exists(local_path)) {
+  try(download.file(uci_url, destfile = local_path, mode = "wb", quiet = TRUE), silent = TRUE)
+}
+
+wine_raw <- readr::read_delim(uci_url, delim = ";", show_col_types = FALSE)
+
+# Clean column names and basic checks
+wine <- wine_raw %>%
+  janitor::clean_names() %>%
+  mutate(across(everything(), ~ .x))
+
+skimr::skim(wine)
+```
+
+## Tidy Columns & Handle Missing
+
+- Standardize names with `clean_names()`.
+- Confirm there are no structural NAs; if any, I’ll drop rows (dataset is small).
+- Engineer a binary target `quality_label` for classification.
+
+```{r cleaning}
+# Drop rows with any NA (no missing values in this dataset)
+wine <- wine %>% drop_na()
+
+# Create a classification label: Good (>=6) vs Poor (<6)
+wine <- wine %>%
+  mutate(
+    quality_label = if_else(quality >= 6, "Good", "Poor") %>% factor(levels = c("Poor", "Good"))
+  )
+
+# Quick sanity checks
+summary(select(wine, quality, quality_label))
+```
+
+<div class="callout success">
+<strong>Note:</strong> The dataset has 11 physicochemical inputs (e.g., <em>alcohol</em>, <em>volatile_acidity</em>, <em>sulphates</em>) and a target <code>quality</code> (0–10). Most entries cluster around 5–6.
+</div>
+
+---
+
+# Exploratory Data Analysis (EDA)
+
+Once the dataset was clean, I explored the distributions of key chemical properties such as acidity, sugar, and alcohol content. I also analyzed how these variables related to wine quality. Through visualizations, I observed clear patterns, for example, higher alcohol content often aligned with higher quality scores. This gave me a sense of which predictors might play the most important roles in modeling.
+
+## Distributions
+
+```{r eda-dists, fig.width=7, fig.height=4}
+wine %>%
+  pivot_longer(cols = -c(quality, quality_label), names_to = "feature", values_to = "value") %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ feature, scales = "free", ncol = 4) +
+  labs(title = "Feature Distributions", x = NULL, y = "Count")
+```
+
+## Bivariate: Alcohol vs Quality
+
+```{r eda-alcohol, fig.width=6.8, fig.height=4.6}
+wine %>%
+  ggplot(aes(alcohol, quality)) +
+  geom_point(alpha = 0.35) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "",
+       x = "Alcohol (%)", y = "Quality (0–10)")
+```
+<div class="callout">
+<strong>Read:</strong> Alcohol is Positively Associated with Quality.
+</div>
+
+## Correlation Heatmap
+
+```{r corr-heatmap, message=FALSE, warning=FALSE, fig.width=7, fig.height=5}
+num_df <- wine %>% select(where(is.numeric))
+
+corr <- round(cor(num_df), 2)
+
+corr %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+  ggplot(aes(var1, var2, fill = r)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "#ef4444", mid = "#f3f4f6", high = "#22c55e", midpoint = 0, limits = c(-1,1)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Heatmap", x = NULL, y = NULL, fill = "r")
+```
+
+<div class="callout">
+<strong>Note:</strong> Alcohol and sulphates correlate positively with quality; volatile acidity correlates negatively.
+</div>
+
+---
+
+# Train/Test Split
+
+I hold out 20% for evaluation to avoid optimistic bias.
+
+```{r split}
+split <- initial_split(wine, prop = 0.8, strata = quality_label)
+train <- training(split)
+test  <- testing(split)
+
+nrow(train); nrow(test)
+```
+
+---
+
+I created two models to better understand the data: a linear regression model and a logistic regression model. The linear regression helped me predict the wine quality score directly, while the logistic regression allowed me to classify wines into low and high quality categories. By comparing the results, I was able to highlight which features had the strongest effects on quality. Alcohol and volatile acidity emerged as key predictors.
+
+# Model A — Linear Regression (Predict Numeric Quality)
+
+## Fit
+
+```{r lm-fit}
+lm_fit <- lm(quality ~ alcohol + sulphates + volatile_acidity + total_sulfur_dioxide + citric_acid + density, data = train)
+
+broom::tidy(lm_fit)
+```
+
+## Diagnostics
+
+```{r lm-diag, fig.width=6.8, fig.height=5}
+par(mfrow = c(2,2))
+plot(lm_fit)
+par(mfrow = c(1,1))
+```
+
+## Performance on Test Set
+
+```{r lm-metrics}
+lm_preds <- tibble(
+  truth = test$quality,
+  .pred = predict(lm_fit, newdata = test)
+)
+
+metrics(lm_preds, truth = truth, estimate = .pred)
+rmse(lm_preds, truth = truth, estimate = .pred)
+rsq_trad(lm_preds, truth = truth, estimate = .pred)
+```
+
+<div class="callout success">
+<strong>Interpretation:</strong> The estimate value of 0.3646 means that, holding other variables constant, a one-unit increase in the predictor (for example, alcohol content) is associated with an average increase of about 0.36 points in the wine quality score. Since the quality score is on a numeric scale, this tells me that the predictor has a modest but meaningful positive impact on wine quality.
+</div>
+
+---
+
+# Model B — Logistic Regression (Good vs Poor)
+
+## Fit
+
+```{r glm-fit}
+glm_fit <- glm(quality_label ~ alcohol + sulphates + volatile_acidity + total_sulfur_dioxide + citric_acid + density,
+               data = train, family = binomial())
+
+broom::tidy(glm_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  arrange(desc(estimate))
+```
+
+## Predict & Evaluate
+
+```{r glm-metrics}
+prob <- predict(glm_fit, newdata = test, type = "response")
+cls  <- if_else(prob >= 0.5, "Good", "Poor") %>% factor(levels = levels(test$quality_label))
+
+results <- tibble(truth = test$quality_label, .pred_prob = prob, .pred_class = cls)
+
+# Confusion Matrix & Accuracy
+conf_mat(results, truth, .pred_class)
+accuracy(results, truth, .pred_class)
+roc_auc(results, truth, .pred_prob, event_level = "second")
+```
+
+<div class="callout success">
+<strong>Interpretation:</strong> The coefficient of 0.8173 represents the log-odds effect of the predictor on the probability of a wine being classified as high quality. Converting this into odds, exp(0.8173) ≈ 2.26. This means that for each one-unit increase in the predictor, the odds of a wine being high quality are about 2.26 times higher. This effect is much stronger compared to the linear model’s incremental increase.
+</div>
+
+## Simple Variable Importance (Standardized Coefficients)
+
+```{r glm-importance}
+# Standardize numeric features for comparability
+scale_cols <- c("alcohol", "sulphates", "volatile_acidity", "total_sulfur_dioxide", "citric_acid", "density")
+train_s <- train %>% mutate(across(all_of(scale_cols), scale))
+
+glm_std <- glm(quality_label ~ alcohol + sulphates + volatile_acidity + total_sulfur_dioxide + citric_acid + density,
+               data = train_s, family = binomial())
+
+imp <- broom::tidy(glm_std) %>% filter(term != "(Intercept)") %>% mutate(abs_stat = abs(statistic))
+
+imp %>%
+  ggplot(aes(reorder(term, abs_stat), abs_stat)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Standardized Importance (|z|)", x = NULL, y = "|z-statistic|")
+```
+
+<div class="callout">
+<strong>Interpretation:</strong> When I standardized the predictors and compared their relative importance, alcohol emerged as the strongest driver of wine quality, confirming that higher alcohol content is consistently associated with better-rated wines. The next most influential factor was volatile acidity, but in this case the relationship is negative, meaning that as volatile acidity increases, wine quality tends to decrease. Sulphates also showed a positive role, acting as a stabilizer that improves the perception of wine quality.
+
+After that, total sulphur dioxide and citric acid had smaller but still noticeable impacts, suggesting that their presence matters but not nearly as much as alcohol or acidity levels. Finally, density ranked lowest in importance, implying that it contributes very little to predicting wine quality once other variables are accounted for.
+</div>
+
+---
+
+# Business-Facing Insights
+
+The analysis clearly shows that alcohol content is the most powerful driver of wine quality, meaning that wines with higher alcohol levels are consistently rated better by consumers. The second most important factor is volatile acidity, but here the relationship is negative—wines with high volatile acidity are perceived as lower quality, highlighting the need to control acidity during production. Sulphates also play a strong positive role, enhancing preservation and sensory appeal.
+
+Beyond these top three factors, total sulphur dioxide and citric acid influence quality but to a lesser extent, suggesting they can fine-tune the product rather than define it. Density, however, shows minimal importance, indicating it should not be a priority for quality optimization.
+
+For producers, this means focusing investment and quality control on balancing alcohol levels, managing volatile acidity, and optimizing sulphates, as these have the greatest impact on consumer perception and ultimately, market success.
+
+<div class="callout warn">
+<strong>Limitations:</strong> The dataset covers a specific region/production process; quality scores are subjective; non-linear interactions are not fully captured by GLM/LM.
+</div>
